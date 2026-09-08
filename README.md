@@ -25,7 +25,7 @@ chatgpt:
   args:
     - run
     - --directory
-    - /Users/dakotafabro/development/chatgpt-mcp
+    - /path/to/chatgpt-mcp
     - chatgpt-mcp
   envs: {}
   env_keys: []

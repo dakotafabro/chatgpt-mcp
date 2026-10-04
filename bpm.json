@@ -1,11 +1,11 @@
 {
   "name": "chatgpt-reader",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "extension",
   "description": "MCP server for reading shared ChatGPT conversations. Paste a share link, get the full transcript as markdown or structured JSON.",
   "entry": "src/chatgpt_mcp/server.py",
   "scope": "session",
-  "token_cost": 200,
+  "token_cost": 300,
   "keywords": ["chatgpt", "conversation", "reader", "mcp", "transcript", "share"],
   "author": {
     "name": "Dakota Fabro",

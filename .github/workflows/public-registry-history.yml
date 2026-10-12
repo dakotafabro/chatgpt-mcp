@@ -1,0 +1,118 @@
+name: Clean public registry history
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/public-registry-history.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: public-registry-history
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install history rewrite tool
+        run: python3 -m pip install --disable-pip-version-check git-filter-repo==2.47.0
+      - name: Verify and replace private registry history
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import tempfile
+          
+          def git(repo, *args):
+              return subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True).stdout
+          
+          def remote_refs(url):
+              raw = subprocess.run(['git', 'ls-remote', '--heads', '--tags', url], check=True, capture_output=True).stdout.decode()
+              return {ref: sha for sha, ref in (line.split() for line in raw.splitlines()) if not ref.endswith('^{}')}
+          
+          def snapshot(repo, ref):
+              files = {}
+              for entry in git(repo, 'ls-tree', '-r', '-z', ref).split(b'\0'):
+                  if entry:
+                      metadata, path = entry.split(b'\t', 1)
+                      mode, kind, sha = metadata.decode().split()
+                      if kind != 'blob':
+                          raise RuntimeError('Submodule requires manual review')
+                      files[path] = (mode, git(repo, 'cat-file', 'blob', sha))
+              return files
+          
+          def main():
+              name = os.environ['GITHUB_REPOSITORY']
+              if name not in {'dakotafabro/bpm-mcp', 'dakotafabro/chatgpt-mcp', 'dakotafabro/hyphae', 'dakotafabro/spore'}:
+                  raise RuntimeError('Repository outside authorized cleanup scope')
+              if os.environ.get('GITHUB_REF') != 'refs/heads/main':
+                  raise RuntimeError('Run must originate from main')
+              work = pathlib.Path(tempfile.mkdtemp(prefix='registry-cleanup-'))
+              askpass = work / 'askpass.sh'
+              askpass.write_text('#!/bin/sh\ncase "$1" in *Username*) echo x-access-token ;; *) echo "$GH_TOKEN" ;; esac\n')
+              askpass.chmod(0o700)
+              os.environ['GIT_ASKPASS'] = str(askpass)
+              os.environ['GIT_TERMINAL_PROMPT'] = '0'
+              url = f'https://github.com/{name}.git'
+              repo = work / 'repo.git'
+              subprocess.run(['git', 'clone', '--mirror', url, str(repo)], check=True)
+              old_refs = remote_refs(url)
+              if old_refs.get('refs/heads/main') != os.environ['GITHUB_SHA']:
+                  raise RuntimeError('Main advanced since workflow started; refusing overwrite')
+              local = dict(line.split() for line in git(repo, 'for-each-ref', '--format=%(refname) %(objectname)').decode().splitlines())
+              if any(local.get(ref) != sha for ref, sha in old_refs.items()):
+                  raise RuntimeError('Remote advanced during clone')
+              before = {ref: snapshot(repo, ref) for ref in old_refs}
+              rules = [
+                  (r'https://[^/\s"<>]+/artifactory/api/pypi/[^/\s"<>]+/simple', 'https://pypi.org/simple'),
+                  (r'https://[^/\s"<>]+/artifactory/api/pypi/[^/\s"<>]+/packages/packages/', 'https://files.pythonhosted.org/packages/'),
+              ]
+              replacements = work / 'replacements.txt'
+              replacements.write_text(''.join(f'regex:{pattern}==>{value}\n' for pattern, value in rules))
+              subprocess.run(['git-filter-repo', '--sensitive-data-removal', '--no-fetch', '--replace-text', str(replacements),
+                              '--replace-message', str(replacements), '--prune-empty', 'never', '--prune-degenerate', 'never'], cwd=repo, check=True)
+              for ref, files in before.items():
+                  after = snapshot(repo, ref)
+                  if files.keys() != after.keys():
+                      raise RuntimeError('Unexpected path changes')
+                  for path, (mode, content) in files.items():
+                      expected = content
+                      for pattern, value in rules:
+                          expected = re.sub(pattern.encode(), value.encode(), expected)
+                      if after[path] != (mode, expected):
+                          raise RuntimeError('Unexpected file or mode change')
+              marker = ('block' + '-artifacts').encode()
+              count = 0
+              for row in git(repo, 'rev-list', '--objects', '--all').decode().splitlines():
+                  data = git(repo, 'cat-file', '-p', row.split()[0]).lower()
+                  if marker in data or any(re.search(pattern.encode(), data) for pattern, _ in rules):
+                      raise RuntimeError('Private registry URL remains in reachable history')
+                  count += 1
+              git(repo, 'fsck', '--full')
+              new_refs = dict(line.split() for line in git(repo, 'for-each-ref', '--format=%(refname) %(objectname)').decode().splitlines())
+              new_refs = {ref: new_refs[ref] for ref in old_refs}
+              if remote_refs(url) != old_refs:
+                  raise RuntimeError('Remote refs advanced; refusing overwrite')
+              leases = [f'--force-with-lease={ref}:{sha}' for ref, sha in old_refs.items()]
+              refspecs = [f'{sha}:{ref}' for ref, sha in new_refs.items()]
+              if os.environ.get('CLEANUP_DRY_RUN') != '1':
+                  subprocess.run(['git', '-C', str(repo), '-c', 'remote.origin.mirror=false', 'push', '--atomic', *leases, url, *refspecs], check=True)
+                  if remote_refs(url) != new_refs:
+                      raise RuntimeError('Remote verification failed')
+              summary = f'Verified {count} reachable objects and {len(new_refs)} branches/tags. Only public registry URL substitutions were made. GitHub cached commits and read-only PR refs may require Support.\n'
+              if os.environ.get('GITHUB_STEP_SUMMARY'):
+                  with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+                      f.write(summary)
+              print(summary)
+          
+          main()
+          PY
